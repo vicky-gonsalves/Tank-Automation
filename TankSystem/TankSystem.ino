@@ -8,6 +8,7 @@
 #include <ArduinoJson.h>
 #include <SocketIoClient.h>
 #include <Wire.h>
+#include <NTPClient.h>
 /*-------------------------------------------------*/
 
 #ifndef STASSID
@@ -23,29 +24,38 @@ const char* password = STAPSK;
 #define I2C_ADDRESS_OTHER 9
 #define I2C_ADDRESS_ME 1
 
+long duration, cm, inches, totalTankfilledAtStart;
+String lastStatus, websocketStatus;
+uint32_t ts1, loopMillis, ts2, pingTime; //millis
 const int trigPin = 12;
 const int echoPin = 13;
 const int totalTankHeight = 49;
+const int cutOff = 30;  //Minutes
+const int noWaterCutoff = 2; //minutes
 long totalHeightFilled = 0;
 long totalTankfilled = 0;
+long cutOffStarted = 0;
 int tankHeightOffset = 3;
 bool motorOn = false;
 bool automate = false;
-long duration, cm, inches;
-String lastStatus;
-uint32_t ts1;
-String websocketStatus;
-long ms1 = 0;
-long cutOffStarted = 0;
-int cutOff = 30;  //Minutes
-int noWaterCutoff = 2; //minutes
-int pingTime; //millis
 bool isCutoff = false;
 int cutOffRelease = 60; //Minutes
-long totalTankfilledAtStart;
-long oneMin = 60000; //millis
+uint32_t oneMin = 60000; //millis
+uint32_t ms1 = 0;
+bool skipCutoff = false;
+int quietHourStart = 19;
+int quietHourEnd = 2;
+int confirmMotorOnCounter = 0;
+int confirmMotorOffCounter = 0;
+int confirmCutoffOffCounter = 0;
+int heightArray[20];
+int tankFillArray[20];
+int loopCount = 0;
 
 SocketIoClient webSocket;
+WiFiUDP ntpUDP;
+
+NTPClient timeClient(ntpUDP, "time.nist.gov", 3600, 60000);
 /*-------------------------------------------------*/
 
 void setup() {
@@ -63,7 +73,7 @@ void setup() {
   // ArduinoOTA.setPort(8266);
 
   // Hostname defaults to esp8266-[ChipID]
-  // ArduinoOTA.setHostname("myesp8266");
+  ArduinoOTA.setHostname("TankSystem");
 
   // No authentication by default
   // ArduinoOTA.setPassword("admin");
@@ -115,6 +125,7 @@ void setup() {
   pinMode(echoPin, INPUT); // Sets the echoPin as an Input
 
   ts1 = millis();
+  loopMillis = millis();
   webSocket.on("connect", connectedEV);
   webSocket.on("disconnect", disconnected);
   webSocket.on("welcome", event);
@@ -123,61 +134,37 @@ void setup() {
   webSocket.on("get-status:remove", event);
   webSocket.begin("somedomain.com");
   // use HTTP Basic Authorization this is optional remove if not needed
-  //    webSocket.setAuthorization("username", "password");
+  webSocket.setAuthorization("tank00000000001", "password123");
+  timeClient.begin();
   /*----------------Custom Setup----------------------*/
 }
 
 void loop() {
+  ts2 = millis();
   ArduinoOTA.handle();
-
-  /*----------------Custom Loop----------------------*/
   webSocket.loop();
-  // Clears the trigPin
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  // Sets the trigPin on HIGH state for 10 micro seconds
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  // Convert the time into a distance
-  duration = pulseIn(echoPin, HIGH);
-  processData(duration);
-
-  uint32_t ts2 = millis();
-
-
-  if (motorOn == true) {
-    pingTime = 5000;
-  } else {
-    pingTime = 60000;
-  }
-
-  //Emit tank water level
-  if ((ts2 - ts1) >= pingTime && totalTankfilled > -1) {
-    emitTankFillStatus();
-  }
-
-
-  if (motorOn && ms1 > 0) {
-    //Cutoff motor if running for more than cutoff time
-    if (!isCutoff && ((millis() - ms1) >= (oneMin * cutOff))) {
-      cutOffMotor();
-    }
-
-    //Cutoff motor if running for more than noWaterCutoff time and no raise in water level
-    if (!isCutoff && (totalTankfilled > -1) && ((millis() - ms1) >= (oneMin * noWaterCutoff))  && (totalTankfilled - totalTankfilledAtStart) <= 2) {
-      cutOffMotor();
-    }
-  }
-
-  //Release Cutoff
-  if (isCutoff && (ts2 - cutOffStarted) >= (oneMin * cutOffRelease)) {
-    releaseCutOffMotor();
-  }
-
-  delay(250);
+  timeClient.update();
   /*----------------Custom Loop----------------------*/
-
+  if ((ts2 - loopMillis) >= 250) {
+    int thisHour = (int)(timeClient.getHours());
+    if (thisHour < quietHourStart && thisHour >= quietHourEnd) {
+      Serial.println("Not Quiet hour");
+    } else {
+      Serial.println("Quiet hour");
+    }
+    // Clears the trigPin
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    // Sets the trigPin on HIGH state for 10 micro seconds
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    // Convert the time into a distance
+    duration = pulseIn(echoPin, HIGH);
+    processData(duration);
+    loopMillis = millis();
+  }
+  /*----------------Custom Loop----------------------*/
 }
 
 void cutOffMotor() {
@@ -194,11 +181,18 @@ void releaseCutOffMotor() {
   isCutoff = false;
   totalTankfilledAtStart = 0;
   transmit("{\"w\":\"c\"}");  //Hack: Turn off Orange LED
+  char buf[50];
+  sprintf(buf, "{\"cutOff\":%d,\"updatedByDevice\":true}", isCutoff);
+  webSocket.emit("get-status:put", buf);
 }
 
 void emitTankFillStatus() {
-  char buf[32];
-  sprintf(buf, "{\"tankFilled\":%lu, \"waterHeight\":%lu}", totalTankfilled, totalHeightFilled);
+  char buf[150];
+  if (isCutoff) {
+    sprintf(buf, "{\"motor\":\"off\",\"tankFilled\":%lu, \"waterHeight\":%lu,\"websocket\":\"connected\", \"cutOff\":%d, \"updatedByDevice\":true}", totalTankfilled, totalHeightFilled, isCutoff);
+  } else {
+    sprintf(buf, "{\"tankFilled\":%lu, \"waterHeight\":%lu,\"websocket\":\"connected\", \"cutOff\":%d, \"updatedByDevice\":true}", totalTankfilled, totalHeightFilled, isCutoff);
+  }
   webSocket.emit("get-status:put", buf);
   ts1 = millis();
 }
@@ -211,64 +205,141 @@ void event(const char * payload, size_t length) {
     return;
   }
   String status = doc["motor"];
-  lastStatus = status;
+  skipCutoff = doc["skipCutoff"];
   automate = doc["automate"];
-  if (status == "on" && !motorOn) {
-    motorToggle(true);
-  } else if (status == "off" && motorOn) {
-    motorToggle(false);
+  lastStatus = status;
+  bool updatedByDevice = doc["updatedByDevice"];
+  if (!updatedByDevice) {
+    if (ms1 == 0 && skipCutoff != doc["skipCutoff"] && skipCutoff == false) {
+      ms1 = millis();
+    } else if (skipCutoff != doc["skipCutoff"] && skipCutoff == true) {
+      ms1 = 0;
+    }
+    if (status == "on" && !motorOn) {
+      motorToggle(true);
+    } else if (status == "off" && motorOn) {
+      motorToggle(false);
+    }
   }
 }
 
 void processData(long d) {
-  cm = (duration / 2) / 29.1;   // Divide by 29.1 or multiply by 0.0343
-  inches = (duration / 2) / 74; // Divide by 74 or multiply by 0.0135
-  Serial.print(inches);
-  Serial.print("in, ");
-  Serial.print(cm);
-  Serial.print("cm");
-  Serial.println();
-  totalTankfilled = (totalTankHeight - (inches - tankHeightOffset)) * 100 / totalTankHeight;
-  totalHeightFilled = 2.54 * (totalTankHeight - (inches - tankHeightOffset));
-  Serial.println(totalTankfilled);
-  transmit("{\"l\":" + (String)totalTankfilled + ", \"m\":\"" + lastStatus + "\",\"w\":\"" + websocketStatus + "\"}");
+  if (loopCount < 20) {
+    cm = (duration / 2) / 29.1;   // Divide by 29.1 or multiply by 0.0343
+    inches = (duration / 2) / 74; // Divide by 74 or multiply by 0.0135
+    Serial.print(inches);
+    Serial.print("in, ");
+    Serial.print(cm);
+    Serial.print("cm");
+    Serial.println();
+    tankFillArray[loopCount] = (totalTankHeight - (inches - tankHeightOffset)) * 100 / totalTankHeight;
+    heightArray[loopCount] = ((totalTankHeight * 2.54) - (cm - (tankHeightOffset * 2.54)));
+    loopCount++;
+  } else {
+    loopCount = 0;
+    totalTankfilled = mostFrequent(tankFillArray, 20);
+    totalHeightFilled = mostFrequent(heightArray, 20);
+    transmit("{\"l\":" + (String)totalTankfilled + ", \"m\":\"" + lastStatus + "\",\"w\":\"" + websocketStatus + "\"}");
+    int thisHour = (int)(timeClient.getHours());
 
-  if (automate && totalTankfilled > 0) {
-    if (totalTankfilled <= 70) {
-      emitMotorToggle(true);
+    if (automate && totalTankfilled > 0) {
+      if (totalTankfilled <= 70  && (thisHour < quietHourStart && thisHour >= quietHourEnd)) {
+        confirmMotorOnCounter++;
+        emitMotorToggle(true);
+      } else if (totalTankfilled >= 100 && totalTankfilled < 110) {
+        confirmMotorOffCounter++;
+        emitMotorToggle(false);
+      } else {
+        confirmMotorOnCounter = 0;
+        confirmMotorOffCounter = 0;
+      }
+    } else if (automate && totalTankfilled < 0) {
+      emitMotorToggle(false);
     }
 
-    if (totalTankfilled >= 100) {
-      emitMotorToggle(false);
+
+    if (motorOn == true) {
+      pingTime = 5000;
+    } else {
+      pingTime = 5000;
+    }
+
+    //Emit tank water level
+    if ((ts2 - ts1) >= pingTime && totalTankfilled > -1) {
       emitTankFillStatus();
     }
-  } else if (automate && totalTankfilled < 0) {
-    emitMotorToggle(false);
+
+    //Release Cutoff
+    if (isCutoff && (ts2 - cutOffStarted) >= (oneMin * cutOffRelease)) {
+      releaseCutOffMotor();
+    }
+
+    //  if (!skipCutoff) {
+    //    if (motorOn && ms1 > 0) {
+    //      //Cutoff motor if running for more than cutoff time
+    //      if (!isCutoff && ((ts2 - ms1) >= (oneMin * cutOff))) {
+    //        cutOffMotor();
+    //      }
+    //
+
+    //Cutoff motor if running for more than noWaterCutoff time and no raise in water level
+    if (!isCutoff && (totalHeightFilled > -1) && ((ts2 - ms1) >= (oneMin * noWaterCutoff))) {
+      if ((totalHeightFilled - totalTankfilledAtStart) > 0 && (totalHeightFilled - totalTankfilledAtStart) <= 2) {
+        confirmCutoffOffCounter++;
+        if (confirmCutoffOffCounter >= 10) {
+          confirmCutoffOffCounter = 0;
+          confirmMotorOffCounter = 10;
+          cutOffMotor();
+        }
+      } else {
+        totalTankfilledAtStart = totalHeightFilled;
+      }
+    }
+
+    //    }
+    //  }
+    //
   }
 }
 
 void motorToggle(bool flag) {
-  if (flag && !isCutoff) {
+  if (flag && !motorOn && !isCutoff) {
     motorOn = true;
-    if (ms1 == 0) {
+    if (ms1 == 0 && !skipCutoff) {
       ms1 = millis();
     }
-    totalTankfilledAtStart = totalTankfilled;
-    transmit("{\"motor\":\"on\"}");
-  } else {
+    totalTankfilledAtStart = totalHeightFilled;
+    transmit("{\"m\":\"on\"}");
+    sendLog("motor on", "true");
+  } else if (!flag && motorOn) {
+    if (!isCutoff && !skipCutoff)  {
+      ms1 = 0;
+    }
     motorOn = false;
-    transmit("{\"motor\":\"off\"}");
+    transmit("{\"m\":\"off\"}");
+    sendLog("motor off", "true");
   }
 }
 
 void emitMotorToggle(bool flag) {
-  if (flag && !motorOn && !isCutoff) {
+  if (flag && !motorOn && !isCutoff && confirmMotorOnCounter >= 10) {
+    confirmMotorOnCounter = 0;
     motorToggle(true);
-    webSocket.emit("get-status:put", "{\"motor\":\"on\"}");
-  } else if (!flag && motorOn) {
+    webSocket.emit("get-status:put", "{\"motor\":\"on\", \"updatedByDevice\":true}");
+  } else if (!flag && motorOn && confirmMotorOffCounter >= 10) {
+    confirmMotorOffCounter = 0;
     motorToggle(false);
-    webSocket.emit("get-status:put", "{\"motor\":\"off\"}");
+    char buf[50];
+    sprintf(buf, "{\"motor\":\"off\",\"cutOff\":%d,\"updatedByDevice\":true}", isCutoff);
+    webSocket.emit("get-status:put", buf);
+    emitTankFillStatus();
   }
+}
+
+void sendLog(char * action, char * wStatus) {
+  char buf[200];
+  sprintf(buf, "{\"action\":\"%s\", \"motorOn\":%d,\"cutOff\":%d,\"automate\":%d,\"tankFilled\":%lu,\"waterHeight\":%lu,\"websocket\":\"%s\", \"skipCutoff\":%d, \"updatedByDevice\":1}" , action, motorOn, isCutoff, automate, totalTankfilled , totalHeightFilled, wStatus, skipCutoff);
+  webSocket.emit("log:save", buf);
 }
 
 void transmit(String message) {
@@ -277,23 +348,10 @@ void transmit(String message) {
   Wire.endTransmission();
 }
 
-void processSlaveData(String data) {
-  DynamicJsonDocument doc(1024);
-  DeserializationError error = deserializeJson(doc, data);
-  if (error) {
-    return;
-  }
-  String action = doc["action"];
-  if (action == "init") {
-    motorOn = false;
-    webSocket.emit("get-status:put", "{\"motor\":\"off\"}");
-  }
-}
-
-
 void disconnected(const char * payload, size_t length) {
+  motorToggle(false);
   websocketStatus = "d";
-  webSocket.emit("get-status:put", "{\"websocket\":\"disconnected\"}");
+  webSocket.emit("get-status:put", "{\"websocket\":\"disconnected\", \"updatedByDevice\":true}");
   delay(oneMin);
   ESP.restart();
 }
@@ -301,17 +359,48 @@ void disconnected(const char * payload, size_t length) {
 
 void connectedEV(const char * payload, size_t length) {
   websocketStatus = "c";
-  webSocket.emit("get-status:put", "{\"websocket\":\"connected\",\"motor\":\"off\"}");
+  webSocket.emit("get-status:put", "{\"websocket\":\"connected\",\"motor\":\"off\", \"updatedByDevice\":true}");
   emitTankFillStatus();
-  transmit("{\"w\":\"c\",\"motor\":\"off\"}");
+  transmit("{\"w\":\"c\",\"m\":\"off\"}");
 }
 
+int mostFrequent(int arr[], int n)
+{
+  // Sort the array
+  sort(arr, n);
 
-void receiveI2C(int howMany) {
-  String response = "";
-  while (Wire.available() > 0) {
-    char c = Wire.read();
-    response += c;
+  // find the max frequency using linear traversal
+  int max_count = 1, res = arr[0], curr_count = 1;
+  for (int i = 1; i < n; i++) {
+    if (arr[i] == arr[i - 1])
+      curr_count++;
+    else {
+      if (curr_count > max_count) {
+        max_count = curr_count;
+        res = arr[i - 1];
+      }
+      curr_count = 1;
+    }
   }
-  Serial.println(response);
+
+  // If last element is most frequent
+  if (curr_count > max_count)
+  {
+    max_count = curr_count;
+    res = arr[n - 1];
+  }
+
+  return res;
+}
+
+void sort(int a[], int size) {
+  for (int i = 0; i < (size - 1); i++) {
+    for (int o = 0; o < (size - (i + 1)); o++) {
+      if (a[o] > a[o + 1]) {
+        int t = a[o];
+        a[o] = a[o + 1];
+        a[o + 1] = t;
+      }
+    }
+  }
 }
